@@ -1,0 +1,12 @@
+build/
+devel/
+log/
+.logs/
+__pycache__/
+*.pyc
+.vscode/
+.idea/
+*.bag
+*.onnx
+*.pt
+*.pth
