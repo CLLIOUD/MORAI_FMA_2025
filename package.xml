@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>morai_script</name>
+  <version>0.0.1</version>
+  <description>ROS1 Noetic용 MORAI 스크립트 모음 (LiDAR 경고, YOLO 신호/정지선, 센서→/status, 경로 퍼블리셔, Stanley 컨트롤러)</description>
+
+  <maintainer email="you@example.com">Your Name</maintainer>
+  <license>MIT</license>
+
+  <!-- 빌드 도구 -->
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- ROS 런타임/빌드 의존성 -->
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>morai_msgs</depend>
+  <depend>custom_msgs</depend>
+  <depend>tf2_ros</depend>
+  <depend>visualization_msgs</depend>
+
+  <!-- (선택) 시스템 파이썬 패키지 표기 가능하지만 보통 pip로 설치
+       ultralytics, opencv-python, scikit-learn, pyproj, numpy 등은 pip로 설치 권장 -->
+  <!-- <exec_depend>python3</exec_depend> -->
+
+  <export/>
+</package>
+

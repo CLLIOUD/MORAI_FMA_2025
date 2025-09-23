@@ -1,0 +1,13 @@
+<launch>
+  <node pkg="morai_script" type="tf_fix.py" name="multi_static_tf" output="screen">
+    <param name="transforms" value="
+      [
+        {'parent':'base_link','child':'Lidar3D-4','xyz':[1.78,0.0,1.18],'rpy_deg':[0,0,0]},
+        {'parent':'base_link','child':'camera_link','xyz':[3.75,0.0,0.45],'rpy_deg':[0,0,0]},
+        {'parent':'base_link','child':'gps','xyz':[3.0,0.0,0.7],'rpy_deg':[0,0,0]},
+        {'parent':'base_link','child':'imu_link','xyz':[3.0,0.0,0.7],'rpy_deg':[0,0,0]}
+      ]
+    " />
+  </node>
+</launch>
+

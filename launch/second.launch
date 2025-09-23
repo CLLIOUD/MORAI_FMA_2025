@@ -1,0 +1,18 @@
+<launch>
+  <arg name="pkg" default="morai_script"/>
+
+  <!-- LiDAR 클러스터링 -->
+  <node pkg="$(arg pkg)" type="lidar_cluster.py" name="lidar_cluster" output="screen" respawn="true">
+    <!-- 필요시 파라미터 -->
+    <!-- <param name="min_r" value="1.65"/> -->
+    <!-- <param name="voxel_leaf" value="0.10"/> -->
+    <!-- <param name="imu_topic" value="/imu/data"/> -->
+  </node>
+
+  <!-- 신호/정지선 인식 -->
+  <node pkg="$(arg pkg)" type="traffic_stop.py" name="traffic_stop" output="screen">
+    <!-- 카메라 토픽 리맵 예시 -->
+    <!-- <remap from="/image_jpeg/compressed" to="/camera/image_raw/compressed"/> -->
+  </node>
+</launch>
+
