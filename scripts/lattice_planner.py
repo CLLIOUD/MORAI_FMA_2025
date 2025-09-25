@@ -90,6 +90,7 @@ class latticePlanner:
         rospy.Subscriber("/right_path",  Path, self.right_cb)
         rospy.Subscriber("/clusters",    PoseArray, self.clusters_cb, queue_size=1)
         rospy.Subscriber("/cluster_distances", Float32MultiArray, self.dist_cb, queue_size=1)
+        rospy.Subscriber("/cluster_features", Float32MultiArray, self.features_cb, queue_size=1)
         rospy.Subscriber("/status", Status, self.status_cb_status, queue_size=10)
 
         # Pubs
@@ -107,6 +108,8 @@ class latticePlanner:
         self.min_edge_m = None; self.min_center_m = None
         self.occ_pct = None; self.ttc_s = None
         self._clusters_stamp = rospy.Time(0)
+        self.cluster_features = []
+        self._features_stamp = rospy.Time(0)
 
         # TF
         self.tfbuf = tf2_ros.Buffer(); self.tfl = tf2_ros.TransformListener(self.tfbuf)
@@ -246,8 +249,18 @@ class latticePlanner:
 
         # >>> NEW: 회피 폭 강화 (후보 오프셋/안전여유)
         self.avoid_width_gain   = g("~avoid_width_gain", 1.08)   # 후보 오프셋 8% 확대
-        self.avoid_extra_clear_m= g("~avoid_extra_clear_m", 0.15) 
+        self.avoid_extra_clear_m= g("~avoid_extra_clear_m", 0.15)
         self.avoid_low_speed_block_mps = float(g("~avoid_low_speed_block_mps", 1.5))
+
+        # 장애물 평행 회피(미니멀 래터럴) 설정
+        self.hug_enable            = bool(g("~hug_enable", True))
+        self.hug_entry_buffer      = g("~hug_entry_buffer", 1.2)
+        self.hug_exit_buffer       = g("~hug_exit_buffer", 1.0)
+        self.hug_secondary_margin  = g("~hug_secondary_margin", 0.35)
+        self.hug_entry_shape       = g("~hug_entry_shape", 0.65)
+        self.hug_exit_relax        = g("~hug_exit_relax", 0.30)
+        self.hug_parallel_scale    = g("~hug_parallel_scale", 0.45)
+        self.hug_tangent_clip      = g("~hug_tangent_clip", 0.60)
 
         self._post_hold_active   = False
         self._post_hold_until_t  = 0.0
@@ -301,6 +314,24 @@ class latticePlanner:
             self.min_edge_m = self.min_center_m = self.min_dist_m = None
             self.occ_pct = self.ttc_s = None
 
+    def features_cb(self, msg: Float32MultiArray):
+        data = list(msg.data)
+        feats = []
+        step = 5
+        for i in range(0, len(data), step):
+            if i + 4 >= len(data):
+                break
+            cx, cy, yaw, half_len, half_width = data[i:i+5]
+            feats.append({
+                'x': float(cx),
+                'y': float(cy),
+                'yaw': float(yaw),
+                'half_len': max(0.0, float(half_len)),
+                'half_width': max(0.0, float(half_width))
+            })
+        self.cluster_features = feats
+        self._features_stamp = rospy.Time.now()
+
     # --------- occupancy helpers ----------
     def _compute_inner_edge_occ(self):
         if self.clusters_map is None or not getattr(self.clusters_map, "poses", None):
@@ -324,7 +355,7 @@ class latticePlanner:
 
     def _apply_stickiness(self, best_idx, best_score):
         now = rospy.get_time()
-        
+
         if self._last_idx is None:
             self._last_idx, self._last_score = best_idx, best_score
             self._stick_cnt, self._hold_until = 0, now + self.min_switch_hold_s
@@ -387,7 +418,7 @@ class latticePlanner:
             lead_gap = x_lead
             v_obj = (v_rel + float(self.v_mps)) if (v_rel is not None) else None
             is_dyn = bool((v_rel is not None) and (abs(v_rel) >= float(rospy.get_param("~dyn_thresh_vrel", 0.3))))
-            
+
             # 퍼블리시 (NaN 처리 대신 값 없는 경우는 생략할 수도 있음)
             if lead_gap is not None: self.pub_lead_gap.publish(Float32(data=float(lead_gap)))
             if v_obj   is not None: self.pub_lead_vobj.publish(Float32(data=float(v_obj)))
@@ -757,6 +788,56 @@ class latticePlanner:
         if math.isinf(best_longi): return 0
         return 1 if best_lat > 0.0 else -1
 
+    def _plan_hugging(self, Ti: np.ndarray, xe: float, lane_w: float, heading: float):
+        if not self.hug_enable or not self.cluster_features:
+            return None
+        best = None
+        max_ahead = float(min(self.corridor_ahead_m, xe))
+        for feat in self.cluster_features:
+            pt = np.array([[feat['x']], [feat['y']], [1.0]], dtype=float)
+            local = Ti.dot(pt)
+            lx = float(local[0]); ly = float(local[1])
+            if lx <= 1.0 or lx >= max_ahead:
+                continue
+            if abs(ly) > lane_w + float(self.side_guard):
+                continue
+            half_w = max(0.05, float(feat['half_width']))
+            half_l = max(0.05, float(feat['half_len']))
+            if best is None or lx < best['lx']:
+                best = {
+                    'lx': lx,
+                    'ly': ly,
+                    'half_w': half_w,
+                    'half_l': half_l,
+                    'yaw': float(feat['yaw'])
+                }
+        if best is None:
+            return None
+
+        side = -1.0 if best['ly'] >= 0.0 else 1.0
+        clearance = float(self.required_clear + self.avoid_extra_clear_m)
+        base_lat = best['ly'] + side * (best['half_w'] + clearance)
+        base_lat = float(np.clip(base_lat, -lane_w, lane_w))
+        secondary = base_lat + side * float(self.hug_secondary_margin)
+        secondary = float(np.clip(secondary, -lane_w, lane_w))
+
+        entry_x = max(2.5, best['lx'] - best['half_l'] - float(self.hug_entry_buffer))
+        exit_x = min(xe - 1.0, best['lx'] + best['half_l'] + float(self.hug_exit_buffer))
+        if exit_x <= entry_x + 0.5:
+            exit_x = min(xe - 0.5, entry_x + 1.5)
+        entry_ratio = max(0.05, min(0.8, entry_x / max(1e-3, xe)))
+        exit_ratio = max(entry_ratio + 0.05, min(0.95, exit_x / max(1e-3, xe)))
+
+        yaw_local = math.atan2(math.sin(best['yaw'] - heading), math.cos(best['yaw'] - heading))
+
+        return {
+            'lat_targets': [base_lat, secondary],
+            'entry_ratio': entry_ratio,
+            'exit_ratio': exit_ratio,
+            'yaw_local': yaw_local,
+            'side': side
+        }
+
     def _slice_path_ahead(self, path: Path, x: float, y: float, length_m: float) -> Path:
         if path is None or len(path.poses) < 2 or x is None or y is None: return None
         xs = np.array([p.pose.position.x for p in path.poses], dtype=float)
@@ -843,7 +924,7 @@ class latticePlanner:
             if getattr(self, "_cutin_guard_active", False):
                 side_hint = -1  # 오른쪽/차로유지 쪽을 선호
                 pool = [i for i in pool if i >= center] or pool  # 왼쪽 후보 대폭 억제
-            
+
             if side_hint > 0:
                 pool = [i for i in pool if i < center] or pool
             elif side_hint == 0 and self.default_avoid_side < 0:
@@ -1008,12 +1089,37 @@ class latticePlanner:
             entry_gain= 1.0
             alpha_eff = bez_alpha
 
+        lat_targets = [y_end + ofs for ofs in offsets]
+        hug_plan = self._plan_hugging(Ti, xe, W, th)
+        hugging_active = False
+        if hug_plan:
+            hugging_active = True
+            lat_targets = hug_plan['lat_targets']
+            offsets = [lat - y_end for lat in lat_targets]
+            alpha_eff = hug_plan['entry_ratio']
+            bez_beta = 1.0 - hug_plan['exit_ratio']
+            bez_push = float(self.hug_entry_shape)
+            bez_relax = float(self.hug_exit_relax)
+            entry_gain = 1.0
+
         N=max(self.min_points, int(xe/0.5)+1)
-        for ofs in offsets:
+        for target_lat, ofs in zip(lat_targets, offsets):
             P0=np.array([0.0, y0], float)
-            P3=np.array([xe, y_end + ofs], float)
-            P1=np.array([xe*alpha_eff, y0 + ofs*bez_push*entry_gain], float)
-            P2=np.array([xe*(1.0-bez_beta), P3[1]-ofs*bez_relax], float)
+            P3=np.array([xe, target_lat], float)
+            if hugging_active:
+                entry_ratio = hug_plan['entry_ratio']
+                exit_ratio  = hug_plan['exit_ratio']
+                entry_lat = y0 + (target_lat - y0) * float(self.hug_entry_shape)
+                span = max(0.0, (exit_ratio - entry_ratio) * xe)
+                slope = math.tan(hug_plan['yaw_local']) if span > 1e-3 else 0.0
+                slope = float(np.clip(slope, -float(self.hug_tangent_clip), float(self.hug_tangent_clip)))
+                hold_lat = target_lat + slope * span * float(self.hug_parallel_scale)
+                hold_lat = float(np.clip(hold_lat, -W, W))
+                P1=np.array([xe*entry_ratio, entry_lat], float)
+                P2=np.array([xe*exit_ratio, hold_lat], float)
+            else:
+                P1=np.array([xe*alpha_eff, y0 + ofs*bez_push*entry_gain], float)
+                P2=np.array([xe*(1.0-bez_beta), P3[1]-ofs*bez_relax], float)
             lp=Path(); lp.header.frame_id='map'
             for i in range(N):
                 t=i/float(N-1)
