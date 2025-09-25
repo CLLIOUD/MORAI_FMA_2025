@@ -75,6 +75,7 @@ class LidarClusterDual:
         rospy.Subscriber("/lidar3D", PointCloud2, self.callback, queue_size=1)
         self.cluster_pub        = rospy.Publisher("/clusters", PoseArray, queue_size=1)
         self.distance_pub       = rospy.Publisher("/cluster_distances", Float32MultiArray, queue_size=1)
+        self.feature_pub        = rospy.Publisher("/cluster_features", Float32MultiArray, queue_size=1)
         self.filtered_pub       = rospy.Publisher("/lidar_filtered", PointCloud2, queue_size=1)
         # 디버깅용(프로파일별 결과도 발행)
         self.cluster_pub_cruise  = rospy.Publisher("/clusters_cruise",  PoseArray, queue_size=1)
@@ -458,8 +459,9 @@ class LidarClusterDual:
     # ─────────────────────────────────────────────────────────────────────
     def _cluster_with_profile(self, xy, header, pro: Profile):
         pa = PoseArray(); pa.header = header
+        features = []
         if xy is None or len(xy) == 0:
-            return pa, 999.0, 999.0
+            return pa, 999.0, 999.0, features
 
         db = DBSCAN(eps=pro.db_eps, min_samples=pro.db_min_samples)
         try:
@@ -492,8 +494,30 @@ class LidarClusterDual:
                 if abs(cy) >= edge_start and (w <= pro.curb_shape_w_max) and (l >= pro.curb_shape_l_min):
                     continue
 
+            # 주성분 분석으로 장애물 방향/폭 계산
+            yaw = 0.0; half_len = max(0.05, 0.5 * l); half_width = max(0.05, 0.5 * w)
+            try:
+                cov = np.cov(pts.T)
+                evals, evecs = np.linalg.eigh(cov)
+                order = np.argsort(evals)[::-1]
+                major = evecs[:, order[0]]
+                major = major / max(1e-6, np.linalg.norm(major))
+                if major[0] < 0.0:
+                    major = -major
+                minor = np.array([-major[1], major[0]])
+                proj_major = pts.dot(major)
+                proj_minor = pts.dot(minor)
+                half_len = max(half_len, 0.5 * (proj_major.max() - proj_major.min()))
+                half_width = max(half_width, 0.5 * (proj_minor.max() - proj_minor.min()))
+                yaw = math.atan2(major[1], major[0])
+            except Exception:
+                yaw = 0.0
+
             p = Pose(); p.position.x = cx; p.position.y = cy; p.position.z = 0.0
+            p.orientation.x = 0.0; p.orientation.y = 0.0
+            p.orientation.z = math.sin(0.5 * yaw); p.orientation.w = math.cos(0.5 * yaw)
             pa.poses.append(p)
+            features.append((cx, cy, yaw, float(half_len), float(half_width)))
 
             d_edge_k   = float(np.min(np.hypot(xs, ys)))
             d_center_k = math.hypot(cx, cy)
@@ -501,8 +525,8 @@ class LidarClusterDual:
             if d_center_k < min_center: min_center = d_center_k
 
         if not pa.poses:
-            return pa, 999.0, 999.0
-        return pa, (min_edge if np.isfinite(min_edge) else 999.0), (min_center if np.isfinite(min_center) else 999.0)
+            return pa, 999.0, 999.0, features
+        return pa, (min_edge if np.isfinite(min_edge) else 999.0), (min_center if np.isfinite(min_center) else 999.0), features
 
     # ─────────────────────────────────────────────────────────────────────
     # 유틸 퍼블리시
@@ -514,6 +538,7 @@ class LidarClusterDual:
         self.cluster_pub_evasive.publish(msg)
         d = Float32MultiArray(); d.data = [999.0, 999.0]
         self.distance_pub.publish(d)
+        self.feature_pub.publish(Float32MultiArray())
 
     def publish_cloud(self, pub, header, xyz_list):
         if not xyz_list: return
@@ -548,8 +573,8 @@ class LidarClusterDual:
         xy_e = np.array(self._voxelize(raw_xy_e, self.voxel_leaf), dtype=float) if raw_xy_e else None
 
         # 클러스터링
-        pa_c, min_edge_c, min_center_c = self._cluster_with_profile(xy_c, hdr, self.pro_cruise)
-        pa_e, min_edge_e, min_center_e = self._cluster_with_profile(xy_e, hdr, self.pro_evasive)
+        pa_c, min_edge_c, min_center_c, feat_c = self._cluster_with_profile(xy_c, hdr, self.pro_cruise)
+        pa_e, min_edge_e, min_center_e, feat_e = self._cluster_with_profile(xy_e, hdr, self.pro_evasive)
 
         # 디버깅 토픽
         self.cluster_pub_cruise.publish(pa_c)
@@ -563,12 +588,22 @@ class LidarClusterDual:
             self.cluster_pub.publish(pa_e)
             self.publish_cloud(self.filtered_pub, hdr, vis_e)
             out = Float32MultiArray(); out.data = [float(min_edge_e), float(min_center_e)]
+            feats = feat_e
         else:
             # 주행 활성
             self.cluster_pub.publish(pa_c)
             self.publish_cloud(self.filtered_pub, hdr, vis_c)
             out = Float32MultiArray(); out.data = [float(min_edge_c), float(min_center_c)]
+            feats = feat_c
         self.distance_pub.publish(out)
+
+        feat_msg = Float32MultiArray()
+        if feats:
+            data = []
+            for cx, cy, yaw, half_len, half_width in feats:
+                data.extend([cx, cy, yaw, half_len, half_width])
+            feat_msg.data = data
+        self.feature_pub.publish(feat_msg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
